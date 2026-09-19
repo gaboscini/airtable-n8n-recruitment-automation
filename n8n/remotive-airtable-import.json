@@ -1,0 +1,736 @@
+{
+  "name": "Remotive to Airtable - Idempotent Job Import",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "40c55019-ddb5-4b81-bfa2-9003550458bf",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -1080,
+        -80
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 12
+            }
+          ]
+        }
+      },
+      "id": "b55ebd49-9810-4a97-82f4-d154bf0c7700",
+      "name": "Every 12 Hours",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -1080,
+        80
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "767b3a57-0fce-4aab-a91f-dd3cd5048e69",
+              "name": "apiUrl",
+              "value": "https://remotive.com/api/remote-jobs",
+              "type": "string"
+            },
+            {
+              "id": "092f9f23-1c83-43f4-8967-9485dab53d8a",
+              "name": "searchTerm",
+              "value": "developer",
+              "type": "string"
+            },
+            {
+              "id": "0bc8d4f8-6ac6-49a4-b795-ae94c25e779d",
+              "name": "maxJobs",
+              "value": 10,
+              "type": "number"
+            },
+            {
+              "id": "31c3370b-ad26-4647-b917-213f38e37ebf",
+              "name": "simulateFailure",
+              "value": false,
+              "type": "boolean"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "d56e14ad-a2a5-4538-92fb-6f2205023d4b",
+      "name": "Configuration",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -840,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.simulateFailure ? 'https://remotive.com/api/not-a-real-endpoint' : $json.apiUrl }}",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "search",
+              "value": "={{ $json.searchTerm }}"
+            },
+            {
+              "name": "limit",
+              "value": "={{ $json.maxJobs }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "df2acc15-6787-4f43-b456-2a44459a783a",
+      "name": "Fetch Remotive Jobs",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -600,
+        0
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "59bf376d-f60a-4424-b119-b247d85392bb",
+              "leftValue": "={{ Array.isArray($json.jobs) && $json.jobs.length > 0 }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "7c73f767-f2ca-4bc7-b32b-80680c4593e5",
+      "name": "Valid API Response?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -360,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const response = $input.first().json;\nconst config = $('Configuration').first().json;\n\nif (!Array.isArray(response.jobs)) {\n  throw new Error('Validation failed: Remotive response does not contain a jobs array.');\n}\n\nconst maxJobs = Math.min(Math.max(Number(config.maxJobs) || 10, 1), 50);\nconst received = response.jobs.length;\nconst selected = response.jobs.slice(0, maxJobs);\nconst seenIds = new Set();\nconst valid = [];\nlet rejected = 0;\n\nfunction cleanText(value, maxLength = 50000) {\n  if (value === null || value === undefined) return '';\n  return String(value)\n    .replace(/<script[\\s\\S]*?<\\/script>/gi, ' ')\n    .replace(/<style[\\s\\S]*?<\\/style>/gi, ' ')\n    .replace(/<[^>]+>/g, ' ')\n    .replace(/&nbsp;/gi, ' ')\n    .replace(/&amp;/gi, '&')\n    .replace(/&quot;/gi, '\"')\n    .replace(/&#39;/gi, \"'\")\n    .replace(/&lt;/gi, '<')\n    .replace(/&gt;/gi, '>')\n    .replace(/\\s+/g, ' ')\n    .trim()\n    .slice(0, maxLength);\n}\n\nfor (const job of selected) {\n  const remotiveJobId = String(job?.id ?? '').trim();\n  const jobTitle = cleanText(job?.title, 500);\n  const company = cleanText(job?.company_name, 500);\n  const jobUrl = String(job?.url ?? '').trim();\n  const publicationDate = new Date(job?.publication_date ?? '');\n  const validUrl = /^https?:\\/\\/[^\\s]+$/i.test(jobUrl);\n\n  if (!remotiveJobId || !jobTitle || !company || !validUrl || Number.isNaN(publicationDate.getTime()) || seenIds.has(remotiveJobId)) {\n    rejected += 1;\n    continue;\n  }\n\n  seenIds.add(remotiveJobId);\n  valid.push({\n    json: {\n      remotiveJobId,\n      jobTitle,\n      company,\n      location: cleanText(job.candidate_required_location || 'Worldwide', 500),\n      jobType: cleanText(job.job_type, 200),\n      publicationDate: publicationDate.toISOString(),\n      jobUrl,\n      category: cleanText(job.category, 300),\n      salaryText: cleanText(job.salary, 500),\n      source: 'Remotive',\n      importedAt: new Date().toISOString(),\n      importStatus: 'New',\n      description: cleanText(job.description),\n      deduplicationKey: `remotive:${remotiveJobId}`,\n      _batchReceived: received,\n      _batchSelected: selected.length,\n      _batchValid: selected.length - rejected,\n      _batchRejected: rejected,\n      _searchTerm: String(config.searchTerm || '')\n    }\n  });\n}\n\nif (valid.length === 0) {\n  throw new Error(`Validation failed: ${selected.length} job records were inspected and none were valid for import.`);\n}\n\nfor (const item of valid) {\n  item.json._batchValid = valid.length;\n  item.json._batchRejected = rejected;\n}\n\nreturn valid;"
+      },
+      "id": "b9806075-e072-4695-b812-7fe0c76a40d9",
+      "name": "Normalize Jobs",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -120,
+        -120
+      ]
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {
+          "reset": false
+        }
+      },
+      "id": "242bb498-639f-4556-a525-c408ff68b657",
+      "name": "Loop Over Jobs",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        120,
+        -120
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "search",
+        "base": {
+          "__rl": true,
+          "value": "appjWilmBmSIATTmC",
+          "mode": "id"
+        },
+        "table": {
+          "__rl": true,
+          "value": "tblPmy7rr0HnGJXar",
+          "mode": "id"
+        },
+        "filterByFormula": "={{ \"{Remotive Job ID}='\" + $json.remotiveJobId + \"'\" }}",
+        "returnAll": false,
+        "limit": 1,
+        "options": {
+          "fields": [
+            "Remotive Job ID"
+          ]
+        }
+      },
+      "id": "68d219ac-045f-447e-afc0-f9d9bc1e42b9",
+      "name": "Find Existing Remotive Job",
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2.2,
+      "position": [
+        360,
+        -40
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "b2f4d1ec-9c5f-468d-aae3-f7b80610979b",
+              "leftValue": "={{ Boolean($json.id) }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "4a6c7ee1-6456-47ce-bee4-f9125735e7d8",
+      "name": "Already Imported?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        600,
+        -40
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const job = $('Loop Over Jobs').item.json;\nreturn [{\n  json: {\n    ...job,\n    outcome: 'skipped',\n    reason: 'Existing Remotive Job ID',\n    airtableRecordId: $json.id || null\n  }\n}];"
+      },
+      "id": "110fbde1-b3ae-402b-aa0f-57b4ef2f73da",
+      "name": "Mark Skipped",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        840,
+        -160
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "create",
+        "base": {
+          "__rl": true,
+          "value": "appjWilmBmSIATTmC",
+          "mode": "id"
+        },
+        "table": {
+          "__rl": true,
+          "value": "tblPmy7rr0HnGJXar",
+          "mode": "id"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Remotive Job ID": "={{ $('Loop Over Jobs').item.json.remotiveJobId }}",
+            "Job Title": "={{ $('Loop Over Jobs').item.json.jobTitle }}",
+            "Company": "={{ $('Loop Over Jobs').item.json.company }}",
+            "Location": "={{ $('Loop Over Jobs').item.json.location }}",
+            "Job Type": "={{ $('Loop Over Jobs').item.json.jobType }}",
+            "Publication Date": "={{ $('Loop Over Jobs').item.json.publicationDate }}",
+            "Job URL": "={{ $('Loop Over Jobs').item.json.jobUrl }}",
+            "Category": "={{ $('Loop Over Jobs').item.json.category }}",
+            "Salary Text": "={{ $('Loop Over Jobs').item.json.salaryText }}",
+            "Source": "Remotive",
+            "Imported At": "={{ $('Loop Over Jobs').item.json.importedAt }}",
+            "Import Status": "New",
+            "Description": "={{ $('Loop Over Jobs').item.json.description }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "Remotive Job ID",
+              "displayName": "Remotive Job ID",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Job Title",
+              "displayName": "Job Title",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Company",
+              "displayName": "Company",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Location",
+              "displayName": "Location",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Job Type",
+              "displayName": "Job Type",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Publication Date",
+              "displayName": "Publication Date",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "dateTime",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Job URL",
+              "displayName": "Job URL",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Category",
+              "displayName": "Category",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Salary Text",
+              "displayName": "Salary Text",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Source",
+              "displayName": "Source",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "options",
+              "options": [
+                {
+                  "name": "Remotive",
+                  "value": "Remotive"
+                }
+              ],
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Imported At",
+              "displayName": "Imported At",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "dateTime",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Import Status",
+              "displayName": "Import Status",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "options",
+              "options": [
+                {
+                  "name": "New",
+                  "value": "New"
+                },
+                {
+                  "name": "Reviewed",
+                  "value": "Reviewed"
+                },
+                {
+                  "name": "Promoted",
+                  "value": "Promoted"
+                },
+                {
+                  "name": "Skipped",
+                  "value": "Skipped"
+                }
+              ],
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Description",
+              "displayName": "Description",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "23f1903b-7bbd-4345-a8d8-88c87d3adb05",
+      "name": "Create Imported Job",
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2.2,
+      "position": [
+        840,
+        80
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const job = $('Loop Over Jobs').item.json;\nreturn [{\n  json: {\n    ...job,\n    outcome: 'created',\n    reason: 'New Remotive Job ID',\n    airtableRecordId: $json.id || null\n  }\n}];"
+      },
+      "id": "4642e506-d031-4694-9cf0-372df806c65d",
+      "name": "Mark Created",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        80
+      ]
+    },
+    {
+      "parameters": {
+        "errorMessage": "={{ 'Remotive import stopped: the API request failed or returned an invalid response. Details: ' + ($json.error?.message || $json.message || 'Expected a non-empty jobs array.') + ' Set Configuration.simulateFailure to false before the next normal run.' }}"
+      },
+      "id": "b254e97c-ae22-48fa-b1b6-d90169d68daa",
+      "name": "Stop - Invalid API Response",
+      "type": "n8n-nodes-base.stopAndError",
+      "typeVersion": 1,
+      "position": [
+        -120,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const results = $input.all().map(item => item.json);\nconst first = results[0] || {};\nconst created = results.filter(item => item.outcome === 'created').length;\nconst skipped = results.filter(item => item.outcome === 'skipped').length;\n\nreturn [{\n  json: {\n    status: 'completed',\n    searchTerm: first._searchTerm || 'developer',\n    apiJobsReceived: first._batchReceived ?? results.length,\n    jobsSelected: first._batchSelected ?? results.length,\n    validJobs: first._batchValid ?? results.length,\n    rejectedJobs: first._batchRejected ?? 0,\n    createdRecords: created,\n    skippedDuplicates: skipped,\n    processedRecords: created + skipped,\n    deduplicationRule: 'Skip when Remotive Job ID already exists',\n    completedAt: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "2fb36cb0-a19e-4db8-aaea-640f0d69ca72",
+      "name": "Execution Summary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1360,
+        -80
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## 1. Trigger & configuration\nManual testing or a controlled 12-hour schedule.",
+        "height": 540,
+        "width": 520,
+        "color": 7
+      },
+      "id": "0c42415b-338e-4a7b-8559-a09031c670e1",
+      "name": "Group 1 - Trigger and Configuration",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -1160,
+        -260
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## 2. Fetch, validate & normalize\nRetrieves Remotive data, retries failures, and prepares valid records.",
+        "height": 540,
+        "width": 660,
+        "color": 5
+      },
+      "id": "51402c98-83cb-4771-9622-b344a619a773",
+      "name": "Group 2 - Fetch and Validate",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -640,
+        -260
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## 3. Deduplicate & write\nSkips existing Remotive IDs and creates only new Airtable records.",
+        "height": 540,
+        "width": 1240,
+        "color": 4
+      },
+      "id": "3b095395-98cf-4384-b8a9-6ca4f88cfe11",
+      "name": "Group 3 - Deduplicate and Write",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        20,
+        -260
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## 4. Execution summary\nReports created, skipped, rejected, and processed records.",
+        "height": 540,
+        "width": 400,
+        "color": 6
+      },
+      "id": "1e54fac4-6a6a-4650-88f5-6b738946fb69",
+      "name": "Group 4 - Execution Summary",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1280,
+        -260
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Configuration",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Every 12 Hours": {
+      "main": [
+        [
+          {
+            "node": "Configuration",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Configuration": {
+      "main": [
+        [
+          {
+            "node": "Fetch Remotive Jobs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Remotive Jobs": {
+      "main": [
+        [
+          {
+            "node": "Valid API Response?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Valid API Response?": {
+      "main": [
+        [
+          {
+            "node": "Normalize Jobs",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Stop - Invalid API Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Jobs": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Jobs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Jobs": {
+      "main": [
+        [
+          {
+            "node": "Execution Summary",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Find Existing Remotive Job",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find Existing Remotive Job": {
+      "main": [
+        [
+          {
+            "node": "Already Imported?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Already Imported?": {
+      "main": [
+        [
+          {
+            "node": "Mark Skipped",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Create Imported Job",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Skipped": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Jobs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Imported Job": {
+      "main": [
+        [
+          {
+            "node": "Mark Created",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Created": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Jobs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Manila",
+    "saveManualExecutions": true
+  },
+  "versionId": "63ffea5d-34be-48d2-8685-cc5122219a12",
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": []
+}
